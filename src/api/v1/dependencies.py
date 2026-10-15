@@ -1,0 +1,307 @@
+from __future__ import annotations
+
+from functools import lru_cache
+from typing import TYPE_CHECKING, Annotated
+
+from fastapi import Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.agents import AgentAskPipeline, AgentService, QueryRefinementService
+from src.infrastructure.database import get_db
+from src.infrastructure.llm.huggingface_embeddings import HuggingFaceEmbeddingProvider
+from src.infrastructure.llm.openai_embeddings import OpenAIEmbeddingProvider
+from src.infrastructure.llm.openai_llm import OpenAILLM
+from src.infrastructure.database import AsyncSessionFactory
+from src.modules.evaluation.judge import ContextRelevanceJudge
+from src.modules.evaluation.retriever import (
+    EvaluationRetriever,
+    RAGRetrievalEvaluatorAdapter,
+)
+from src.modules.evaluation.service import RetrievalEvaluationService
+from src.rag.embeddings import EmbeddingProvider
+from src.rag.ingestion import (
+    ChunkingStrategyRegistry,
+    FixedWindowChunkingStrategy,
+    PDFExtractor,
+    PDFPlumberExtractor,
+    RecursiveSemanticChunkingStrategy,
+)
+from src.rag.pipeline import RAGIngestionService, RAGRetrievalService
+from src.rag.reranker import Reranker
+from src.rag.vectorstore import VectorStore
+from src.settings.config import settings
+from src.shared.interfaces.llm import LLM
+from src.tools import PingTool, RetrieverTool, ToolRegistry
+from src.modules.documents.dependencies import DocumentsRepositoryDep
+
+if TYPE_CHECKING:
+    from src.modules.semantic_cache.repository import SemanticCacheRepository
+    from src.modules.semantic_cache.service import SemanticCacheService
+
+DbSessionDep = Annotated[AsyncSession, Depends(get_db)]
+
+
+@lru_cache
+def get_llm() -> LLM:
+    if not settings.openai_key:
+        raise RuntimeError("Missing OPENAI_KEY in environment.")
+    if not settings.model:
+        raise RuntimeError("Missing MODEL in environment.")
+
+    return OpenAILLM(
+        api_key=settings.openai_key,
+        model=settings.model,
+        base_url=settings.ollama_base_url,
+    )
+
+
+LLMDep = Annotated[LLM, Depends(get_llm)]
+
+
+def get_query_refinement_service(llm: LLMDep) -> QueryRefinementService:
+    return QueryRefinementService(
+        llm=llm,
+        enabled=settings.query_refinement_enabled,
+        temperature=settings.query_refinement_temperature,
+        max_tokens=settings.query_refinement_max_tokens,
+    )
+
+
+QueryRefinementServiceDep = Annotated[
+    QueryRefinementService, Depends(get_query_refinement_service)
+]
+
+
+@lru_cache
+def get_embedding_provider() -> EmbeddingProvider:
+    if not settings.embedding_model:
+        raise RuntimeError("Missing EMBEDDING_MODEL in environment.")
+    provider_name = settings.embedding_provider
+
+    if provider_name == "openai":
+        if not settings.openai_key:
+            raise RuntimeError("Missing OPENAI_KEY in environment.")
+        return OpenAIEmbeddingProvider(
+            api_key=settings.openai_key,
+            model=settings.embedding_model,
+            base_url=settings.embedding_base_url,
+        )
+
+    if provider_name == "huggingface":
+        return HuggingFaceEmbeddingProvider(model_name=settings.embedding_model)
+
+    raise RuntimeError(
+        f"Unsupported EMBEDDING_PROVIDER '{provider_name}'. Use 'openai' or 'huggingface'."
+    )
+
+
+EmbeddingProviderDep = Annotated[EmbeddingProvider, Depends(get_embedding_provider)]
+
+
+def get_semantic_cache_repository(session: DbSessionDep) -> "SemanticCacheRepository":
+    from src.modules.semantic_cache.repository import SemanticCacheRepository
+
+    return SemanticCacheRepository(session)
+
+
+SemanticCacheRepositoryDep = Annotated[
+    "SemanticCacheRepository", Depends(get_semantic_cache_repository)
+]
+
+
+def get_semantic_cache_service(
+    repository: SemanticCacheRepositoryDep,
+) -> "SemanticCacheService":
+    from src.modules.semantic_cache.service import SemanticCacheService
+
+    return SemanticCacheService(
+        repository=repository,
+        enabled=settings.semantic_cache_enabled,
+        similarity_threshold=settings.semantic_cache_similarity_threshold,
+    )
+
+
+SemanticCacheServiceDep = Annotated["SemanticCacheService", Depends(get_semantic_cache_service)]
+
+
+@lru_cache
+def get_vector_store() -> VectorStore:
+    from src.infrastructure.vector_db.chroma_vectorstore import ChromaVectorStore
+
+    return ChromaVectorStore(
+        persist_dir=settings.chroma_persist_dir,
+        collection_name=settings.resolved_rag_collection_name(),
+    )
+
+
+VectorStoreDep = Annotated[VectorStore, Depends(get_vector_store)]
+
+
+@lru_cache
+def get_reranker() -> Reranker | None:
+    if not settings.reranker_enabled:
+        return None
+    if not settings.reranker_api_key:
+        raise RuntimeError("Missing RERANKER_API_KEY in environment.")
+    if not settings.reranker_model:
+        raise RuntimeError("Missing RERANKER_MODEL in environment.")
+
+    from src.infrastructure.reranker import CohereReranker
+
+    return CohereReranker(
+        api_key=settings.reranker_api_key,
+        model=settings.reranker_model,
+    )
+
+
+RerankerDep = Annotated[Reranker | None, Depends(get_reranker)]
+
+
+@lru_cache
+def get_pdf_extractor() -> PDFExtractor:
+    return PDFPlumberExtractor(
+        dedupe_threshold=settings.rag_pdf_dedupe_threshold,
+    )
+
+
+PDFExtractorDep = Annotated[PDFExtractor, Depends(get_pdf_extractor)]
+
+
+@lru_cache
+def get_chunking_registry() -> ChunkingStrategyRegistry:
+    return ChunkingStrategyRegistry(
+        [
+            FixedWindowChunkingStrategy(),
+            RecursiveSemanticChunkingStrategy(),
+        ]
+    )
+
+
+ChunkingRegistryDep = Annotated[ChunkingStrategyRegistry, Depends(get_chunking_registry)]
+
+
+@lru_cache
+def get_rag_ingestion_service() -> RAGIngestionService:
+    registry = get_chunking_registry()
+    registry.resolve(settings.default_chunking_strategy)
+    return RAGIngestionService(
+        embedding_provider=get_embedding_provider(),
+        vector_store=get_vector_store(),
+        chunking_registry=registry,
+        default_chunking_strategy=settings.default_chunking_strategy,
+        chunk_size=settings.rag_chunk_size,
+        chunk_overlap=settings.rag_chunk_overlap,
+        pdf_extractor=get_pdf_extractor(),
+        pdf_max_pages=settings.rag_pdf_max_pages,
+    )
+
+
+RAGIngestionServiceDep = Annotated[RAGIngestionService, Depends(get_rag_ingestion_service)]
+
+
+@lru_cache
+def get_rag_retrieval_service() -> RAGRetrievalService:
+    return RAGRetrievalService(
+        embedding_provider=get_embedding_provider(),
+        vector_store=get_vector_store(),
+        default_top_k=settings.rag_top_k,
+        prefetch_k=settings.rag_prefetch_k,
+        reranker=get_reranker(),
+    )
+
+
+RAGRetrievalServiceDep = Annotated[RAGRetrievalService, Depends(get_rag_retrieval_service)]
+
+
+@lru_cache
+def get_retriever_tool() -> RetrieverTool:
+    return RetrieverTool(
+        retrieval_service=get_rag_retrieval_service(),
+        default_top_k=settings.rag_top_k,
+    )
+
+
+@lru_cache
+def get_tool_registry() -> ToolRegistry:
+    return ToolRegistry([PingTool(), get_retriever_tool()])
+
+
+ToolRegistryDep = Annotated[ToolRegistry, Depends(get_tool_registry)]
+
+
+def get_agent_service(llm: LLMDep, registry: ToolRegistryDep) -> AgentService:
+    return AgentService(
+        llm=llm,
+        registry=registry,
+        max_steps=settings.agent_max_steps,
+        temperature=settings.agent_temperature,
+        max_tokens=settings.agent_max_tokens,
+        timeout_s=settings.agent_timeout_s,
+        system_prompt=settings.agent_system_prompt,
+    )
+
+
+AgentServiceDep = Annotated[AgentService, Depends(get_agent_service)]
+
+
+def get_agent_ask_pipeline(
+    agent_service: AgentServiceDep,
+    llm: LLMDep,
+    query_refinement_service: QueryRefinementServiceDep,
+    embedding_provider: EmbeddingProviderDep,
+    semantic_cache_service: SemanticCacheServiceDep,
+    documents_repository: DocumentsRepositoryDep,
+) -> AgentAskPipeline:
+    return AgentAskPipeline(
+        agent_service=agent_service,
+        llm=llm,
+        query_refinement_service=query_refinement_service,
+        embedding_provider=embedding_provider,
+        semantic_cache_service=semantic_cache_service,
+        documents_repository=documents_repository,
+    )
+
+
+AgentAskPipelineDep = Annotated[AgentAskPipeline, Depends(get_agent_ask_pipeline)]
+
+
+@lru_cache
+def get_evaluation_retriever() -> EvaluationRetriever:
+    return RAGRetrievalEvaluatorAdapter(
+        retrieval_service=get_rag_retrieval_service(),
+    )
+
+
+@lru_cache
+def get_evaluation_judge() -> ContextRelevanceJudge | None:
+    if not settings.openai_key:
+        raise RuntimeError("Missing OPENAI_KEY in environment.")
+    if not settings.evaluation_judge_model:
+        raise RuntimeError("Missing EVALUATION_JUDGE_MODEL in environment.")
+
+    llm = OpenAILLM(
+        api_key=settings.openai_key,
+        model=settings.evaluation_judge_model,
+        base_url=settings.evaluation_judge_base_url or settings.ollama_base_url,
+    )
+    return ContextRelevanceJudge(
+        llm=llm,
+        max_tokens=settings.evaluation_judge_max_tokens,
+        temperature=settings.evaluation_judge_temperature,
+        timeout_s=settings.evaluation_judge_timeout_s,
+    )
+
+
+@lru_cache
+def get_retrieval_evaluation_service() -> RetrievalEvaluationService:
+    return RetrievalEvaluationService(
+        session_factory=AsyncSessionFactory,
+        dataset_storage_dir=settings.evaluation_data_dir,
+        retriever_factory=get_evaluation_retriever,
+        judge_factory=get_evaluation_judge,
+    )
+
+
+RetrievalEvaluationServiceDep = Annotated[
+    RetrievalEvaluationService, Depends(get_retrieval_evaluation_service)
+]
